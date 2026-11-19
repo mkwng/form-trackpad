@@ -470,19 +470,23 @@ public final class GestureEngine {
         recentArc = recentArc * fade + turn * between.length / 2
         let pan = recentPan.length, stretch = abs(recentStretch), arc = abs(recentArc)
 
-        // Joining an existing gesture takes a clearer motion than starting one, and it has to hold
-        // its own against what the fingers are already doing. A scroll with fingers drifting apart
-        // stays a scroll; a pinch with one finger resting does not start to pan.
-        if !scrolling, pan >= 2.5, pan >= 0.6 * max(stretch, arc) {
-            scrolling = true
-            axisLock = .free
-            emitScroll(.zero, phase: .began, time: time, &out)
+        // Zoom and rotate run together, as on a Magic Trackpad. Scrolling does not mix with them:
+        // apps stop following a pinch or a twist while a scroll is also in flight. So a deliberate
+        // pinch or twist ends the scroll, and the scroll stays out until the fingers lift.
+        // Taking over from a scroll takes a clearer motion than starting from rest, so a scroll
+        // with fingers drifting apart stays a scroll.
+        let need = scrolling ? 3.5 : 2.0
+        let joinZoom = !zooming && stretch >= need && stretch >= max(scrolling ? 0.5 * pan : 0, 0.25 * arc)
+        let joinRotate = !rotating && arc >= need && arc >= max(scrolling ? 0.5 * pan : 0, 0.25 * stretch)
+        if scrolling, joinZoom || joinRotate {
+            scrolling = false
+            out.append(.scroll(phase: .ended, dx: 0, dy: 0, velocity: .zero))
         }
-        if !zooming, stretch >= (scrolling && !rotating ? 3.5 : 2), stretch >= max(scrolling ? 0.5 * pan : 0, 0.25 * arc) {
+        if joinZoom {
             zooming = true
             out.append(.magnify(phase: .began, delta: 0))
         }
-        if !rotating, arc >= (scrolling && !zooming ? 3.5 : 2), arc >= max(scrolling ? 0.5 * pan : 0, 0.25 * stretch) {
+        if joinRotate {
             rotating = true
             out.append(.rotate(phase: .began, degrees: 0))
         }

@@ -43,7 +43,7 @@ Known gaps:
 | 2 | Tap | Right click |
 | 2 | Double tap | Smart zoom |
 | 2 | Move | Scroll, with momentum; swipes between pages in Safari |
-| 2 | Pinch, twist | Zoom and rotate, together with scrolling if the fingers also travel |
+| 2 | Pinch, twist | Zoom and rotate, together |
 | 3 | Tap | Look up |
 | 3 or 4 | Swipe sideways | Switch Spaces and full-screen apps |
 | 3 or 4 | Swipe up or down | Mission Control, App Exposé |

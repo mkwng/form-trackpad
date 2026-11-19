@@ -297,22 +297,35 @@ final class GestureEngineTests: XCTestCase {
         }
     }
 
-    func testPinchThenMoveZoomsAndPansTogether() {
+    func testPinchThenMoveKeepsZoomingWithoutScrolling() {
         let pad = Pad()
         pad.down(0, 25, 60); pad.down(1, 40, 60)
         pad.drag([0: Vec(-6, 0), 1: Vec(6, 0)], over: 0.2)
-        XCTAssertFalse(pad.scrollPhases.contains(.began))
         // Keep spreading while carrying both fingers up the pad.
         pad.drag([0: Vec(-4, -20), 1: Vec(4, -20)], over: 0.3)
-        XCTAssertTrue(pad.scrollPhases.contains(.began))
-        XCTAssertLessThan(pad.scrolled.y, -50)
+        XCTAssertFalse(pad.scrollPhases.contains(.began))
         XCTAssertGreaterThan(total(pad, magnify: true), 0.35)
         pad.up(0, 1)
-        guard case .scroll(.ended, _, _, let velocity) = pad.actions.first(where: {
-            if case .scroll(.ended, _, _, _) = $0 { return true } else { return false }
-        }) else { return XCTFail("no scroll end") }
-        XCTAssertEqual(velocity, .zero, "no coasting after a zoom")
         XCTAssertEqual(pad.count(.magnify(phase: .ended, delta: 0)), 1)
+    }
+
+    func testPinchAndTwistWhileDriftingNeverScrollsAlongside() {
+        let pad = Pad()
+        pad.down(0, 25, 60); pad.down(1, 40, 60)
+        // The hand drifts first, which starts a scroll, then pinches and twists.
+        pad.drag([0: Vec(0, 3), 1: Vec(0, 3)], over: 0.1)
+        pad.drag([0: Vec(-5, 8), 1: Vec(5, -8)], over: 0.4)
+        XCTAssertEqual(pad.count(.magnify(phase: .began, delta: 0)), 1)
+        XCTAssertEqual(pad.count(.rotate(phase: .began, degrees: 0)), 1)
+        let firstTransform = pad.actions.firstIndex {
+            if case .magnify = $0 { return true }
+            if case .rotate = $0 { return true }
+            return false
+        }!
+        let lastScroll = pad.actions.lastIndex { if case .scroll = $0 { return true } else { return false } }!
+        XCTAssertLessThan(lastScroll, firstTransform, "the scroll is closed before zoom or rotate starts")
+        guard case .scroll(.ended, _, _, let velocity) = pad.actions[lastScroll] else { return XCTFail("scroll not ended") }
+        XCTAssertEqual(velocity, .zero)
     }
 
     func testPinchAndTwistTogether() {
@@ -325,13 +338,14 @@ final class GestureEngineTests: XCTestCase {
         XCTAssertGreaterThan(total(pad, magnify: true), 0.25)
     }
 
-    func testScrollThenDeliberatePinchAddsZoom() {
+    func testScrollThenDeliberatePinchSwitchesToZoom() {
         let pad = Pad()
         pad.down(0, 25, 40); pad.down(1, 40, 40)
         pad.drag([0: Vec(0, 15), 1: Vec(0, 15)], over: 0.3)
         pad.wait(0.3)
         pad.drag([0: Vec(-8, 0), 1: Vec(8, 0)], over: 0.25)
         XCTAssertEqual(pad.count(.magnify(phase: .began, delta: 0)), 1)
+        XCTAssertEqual(pad.scrollPhases.last, .ended)
     }
 
     func testFingersDriftingApartDuringAScrollDoNotZoom() {
