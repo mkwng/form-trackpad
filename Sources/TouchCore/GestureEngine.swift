@@ -1,0 +1,455 @@
+import Foundation
+
+/// Turns raw finger frames into pointer, click, scroll and gesture actions.
+///
+/// Pure logic with no system calls, so it can be driven by recorded or invented frames in tests.
+/// Time only moves when the caller passes it in, through `process` or `advance`.
+public final class GestureEngine {
+    public var tuning: Tuning
+    /// Seconds since the last key press. Lets the engine ignore palms that brush the pad mid-typing.
+    public var secondsSinceKeystroke: () -> Double = { .infinity }
+
+    public init(tuning: Tuning = Tuning()) { self.tuning = tuning }
+
+    private struct Track {
+        let id: Int
+        let start: Vec
+        var position: Vec
+        var previous: Vec
+        /// Where this finger was when the current gesture decision started.
+        var origin: Vec
+        var travel = 0.0
+        var palm: Bool
+    }
+
+    private enum Mode: Equatable {
+        case idle, pending, pointing, dragging, scrolling, pinching, rotating
+        case swiping(SwipeAxis)
+        /// A multi-finger gesture just ended with fingers still down; ignore them until `until`.
+        case settling(until: Double)
+    }
+
+    private enum AxisLock { case free, horizontal, vertical }
+
+    private var tracks: [Int: Track] = [:]
+    private var mode = Mode.idle
+    private var fingerCount = 0
+    private var lastTime = 0.0
+    private var buttons: UInt8 = 0
+
+    private var sessionStart = 0.0
+    private var sessionMaxFingers = 0
+    private var sessionMaxTravel = 0.0
+    private var sessionGestured = false
+    private var sessionSuspect = false
+    private var pendingSince = 0.0
+    private var scrollMayBegin = false
+
+    /// A tap just happened; a touch that lands before this time may become a drag.
+    private var armedUntil: Double?
+    private var dragCandidate = false
+    /// We are holding the left button after a drag lift, until this time.
+    private var dragReleaseAt: Double?
+
+    private var gestureStart = 0.0
+    private var smoothedSpeed = 0.0
+    private var axisLock = AxisLock.free
+    private var offAxis = 0.0
+    private var samples: [(time: Double, delta: Vec)] = []
+    private var lastDistance = 0.0
+    private var lastAngle = 0.0
+
+    // MARK: Input
+
+    public func process(_ frame: Frame) -> [Action] {
+        var out = advance(to: frame.time)
+        let dt = min(max(frame.time - lastTime, 0.004), 0.05)
+        lastTime = frame.time
+
+        updateButtons(frame.buttons, &out)
+
+        var landed = false
+        var seen = Set<Int>()
+        for contact in frame.contacts where contact.touching {
+            seen.insert(contact.id)
+            if var track = tracks[contact.id] {
+                track.previous = track.position
+                track.position = contact.position
+                track.travel = max(track.travel, (contact.position - track.start).length)
+                if !contact.confident { track.palm = true }
+                tracks[contact.id] = track
+            } else {
+                tracks[contact.id] = Track(id: contact.id, start: contact.position, position: contact.position,
+                                           previous: contact.position, origin: contact.position,
+                                           palm: !contact.confident)
+                if contact.confident { landed = true }
+            }
+        }
+        for id in tracks.keys where !seen.contains(id) { tracks[id] = nil }
+
+        let active = activeTracks
+        if landed { out.append(.touchBegan) }
+        sessionMaxTravel = max(sessionMaxTravel, active.map(\.travel).max() ?? 0)
+
+        if active.count != fingerCount {
+            fingerCountChanged(to: active.count, time: frame.time, &out)
+        }
+        if !active.isEmpty { step(active, time: frame.time, dt: dt, &out) }
+        return out
+    }
+
+    /// Runs anything that is due by `time` even though no finger report arrived.
+    public func advance(to time: Double) -> [Action] {
+        var out: [Action] = []
+        if let release = dragReleaseAt, time >= release {
+            dragReleaseAt = nil
+            out.append(.buttonUp(.left))
+        }
+        if dragCandidate, mode == .pending, fingerCount == 1, time - sessionStart > tuning.tapMaxDuration {
+            beginDrag(&out)
+        }
+        return out
+    }
+
+    /// When `advance` next needs to be called, if no report arrives first.
+    public var nextDeadline: Double? {
+        var deadlines: [Double] = []
+        if let release = dragReleaseAt { deadlines.append(release) }
+        if dragCandidate, mode == .pending, fingerCount == 1 {
+            deadlines.append(sessionStart + tuning.tapMaxDuration + 0.001)
+        }
+        return deadlines.min()
+    }
+
+    /// The pad went away: end whatever is in flight and let go of every button.
+    public func reset() -> [Action] {
+        var out: [Action] = []
+        endGesture(time: lastTime, fingersLeft: 0, &out)
+        if mode == .dragging || dragReleaseAt != nil { out.append(.buttonUp(.left)) }
+        updateButtons(0, &out)
+        tracks = [:]
+        mode = .idle
+        fingerCount = 0
+        dragReleaseAt = nil
+        armedUntil = nil
+        dragCandidate = false
+        return out
+    }
+
+    // MARK: Finger count changes
+
+    private var activeTracks: [Track] {
+        tracks.values.filter { !$0.palm }.sorted { $0.id < $1.id }
+    }
+
+    private func fingerCountChanged(to count: Int, time: Double, _ out: inout [Action]) {
+        let previous = fingerCount
+        fingerCount = count
+
+        if previous == 0 {
+            startSession(count: count, time: time, &out)
+            return
+        }
+        sessionMaxFingers = max(sessionMaxFingers, count)
+        if count != 1 { dragCandidate = false }
+
+        if count == 0 {
+            endSession(time: time, &out)
+            return
+        }
+
+        switch mode {
+        case .idle, .pending, .pointing:
+            enterPending(count: count, time: time, &out)
+        case .dragging:
+            break
+        case .scrolling:
+            if count < 2 {
+                endGesture(time: time, fingersLeft: count, &out)
+                mode = .settling(until: time + 0.15)
+            } else if count >= 3, time - gestureStart < 0.1 {
+                // A third finger landed just after two started moving: it was a swipe all along.
+                out.append(.scroll(phase: .ended, dx: 0, dy: 0, velocity: .zero))
+                enterPending(count: count, time: time, &out)
+            }
+        case .pinching, .rotating:
+            if count < 2 {
+                endGesture(time: time, fingersLeft: count, &out)
+                mode = .settling(until: .infinity)
+            }
+        case .swiping:
+            if count < 3 {
+                endGesture(time: time, fingersLeft: count, &out)
+                mode = .settling(until: .infinity)
+            }
+        case .settling(let until):
+            if count >= 2, until.isFinite { enterPending(count: count, time: time, &out) }
+        }
+    }
+
+    private func startSession(count: Int, time: Double, _ out: inout [Action]) {
+        sessionStart = time
+        sessionMaxFingers = count
+        sessionMaxTravel = 0
+        sessionGestured = false
+        sessionSuspect = secondsSinceKeystroke() < tuning.typingGuard
+
+        if dragReleaseAt != nil {
+            dragReleaseAt = nil
+            if count == 1 {
+                // Finger came back during the grace period: carry on dragging.
+                mode = .dragging
+                sessionGestured = true
+                smoothedSpeed = 0
+                return
+            }
+            out.append(.buttonUp(.left))
+        }
+
+        dragCandidate = count == 1 && (armedUntil.map { time <= $0 } ?? false)
+        armedUntil = nil
+        mode = .idle
+        enterPending(count: count, time: time, &out)
+    }
+
+    private func enterPending(count: Int, time: Double, _ out: inout [Action]) {
+        if scrollMayBegin, count != 2 { cancelMayBegin(&out) }
+        mode = .pending
+        pendingSince = time
+        for id in tracks.keys { tracks[id]!.origin = tracks[id]!.position }
+        if count == 2, !scrollMayBegin {
+            scrollMayBegin = true
+            out.append(.scroll(phase: .mayBegin, dx: 0, dy: 0, velocity: .zero))
+        }
+    }
+
+    private func cancelMayBegin(_ out: inout [Action]) {
+        guard scrollMayBegin else { return }
+        scrollMayBegin = false
+        out.append(.scroll(phase: .cancelled, dx: 0, dy: 0, velocity: .zero))
+    }
+
+    private func endSession(time: Double, _ out: inout [Action]) {
+        endGesture(time: time, fingersLeft: 0, &out)
+        cancelMayBegin(&out)
+
+        if mode == .dragging {
+            dragReleaseAt = time + tuning.dragReleaseDelay
+        } else if !sessionGestured, !sessionSuspect, secondsSinceKeystroke() >= tuning.typingGuard {
+            let multi = sessionMaxFingers > 1
+            let quick = time - sessionStart <= tuning.tapMaxDuration + (multi ? 0.05 : 0)
+            let still = sessionMaxTravel <= tuning.tapSlop * (multi ? 1.5 : 1)
+            if quick, still {
+                switch sessionMaxFingers {
+                case 1:
+                    out.append(.click(.left))
+                    armedUntil = time + tuning.tapDragWindow
+                case 2: out.append(.click(.right))
+                case 3: out.append(.click(.middle))
+                default: break
+                }
+            }
+        }
+        dragCandidate = false
+        mode = .idle
+    }
+
+    /// Closes the scroll, pinch, rotate or swipe in progress, if any.
+    private func endGesture(time: Double, fingersLeft: Int, _ out: inout [Action]) {
+        switch mode {
+        case .scrolling:
+            out.append(.scroll(phase: .ended, dx: 0, dy: 0, velocity: recentVelocity(at: time)))
+        case .pinching:
+            out.append(.magnify(phase: .ended, delta: 0))
+        case .rotating:
+            out.append(.rotate(phase: .ended, degrees: 0))
+        case .swiping(let axis):
+            let v = recentVelocity(at: time)
+            out.append(.swipe(axis: axis, phase: .ended, delta: 0, velocity: axis == .horizontal ? v.x : v.y))
+        default:
+            break
+        }
+    }
+
+    // MARK: Per-frame work
+
+    private func step(_ active: [Track], time: Double, dt: Double, _ out: inout [Action]) {
+        let delta = meanDelta(active)
+        smoothedSpeed = 0.5 * smoothedSpeed + 0.5 * (delta.length / dt)
+
+        switch mode {
+        case .idle:
+            break
+
+        case .pending:
+            decide(active, time: time, &out)
+            // Use this frame's motion right away if a pointer mode was just chosen.
+            if mode == .pointing || mode == .dragging { movePointer(delta, &out) }
+
+        case .pointing, .dragging:
+            movePointer(delta, &out)
+
+        case .scrolling:
+            emitScroll(delta, phase: .changed, time: time, &out)
+
+        case .pinching:
+            guard active.count >= 2 else { break }
+            let distance = (active[1].position - active[0].position).length
+            let change = (distance - lastDistance) / tuning.pinchScale
+            lastDistance = distance
+            if change != 0 { out.append(.magnify(phase: .changed, delta: change)) }
+
+        case .rotating:
+            guard active.count >= 2 else { break }
+            let angle = Self.angle(active[1].position - active[0].position)
+            let change = Self.wrap(angle - lastAngle)
+            lastAngle = angle
+            // The pad's y axis points down, so a positive angle change is clockwise on the pad.
+            if change != 0 { out.append(.rotate(phase: .changed, degrees: -change * 180 / .pi)) }
+
+        case .swiping(let axis):
+            let progress = delta * (1 / tuning.swipeScale)
+            let amount = axis == .horizontal ? progress.x : progress.y
+            samples.append((time, progress))
+            if amount != 0 { out.append(.swipe(axis: axis, phase: .changed, delta: amount, velocity: 0)) }
+
+        case .settling(let until):
+            if active.count == 1, time >= until { enterPending(count: 1, time: time, &out) }
+        }
+    }
+
+    private func decide(_ active: [Track], time: Double, _ out: inout [Action]) {
+        let waited = time - pendingSince
+        let displacement = active.map { $0.position - $0.origin }
+        let pan = displacement.reduce(Vec.zero, +) * (1 / Double(active.count))
+
+        switch active.count {
+        case 1:
+            if dragCandidate {
+                if pan.length > 0.8 { beginDrag(&out) }
+                return
+            }
+            let typing = secondsSinceKeystroke() < tuning.typingGuard
+            // After more fingers were down, the last one is usually on its way off the pad too.
+            let minimumWait = sessionMaxFingers > 1 ? 0.08 : 0.012
+            if waited >= minimumWait, pan.length > 0.4 || waited > 0.1, !typing {
+                mode = .pointing
+                smoothedSpeed = 0
+            }
+
+        case 2:
+            guard waited >= 0.025 else { return }
+            let before = active[1].origin - active[0].origin
+            let now = active[1].position - active[0].position
+            let stretch = abs(now.length - before.length)
+            let turn = Self.wrap(Self.angle(now) - Self.angle(before))
+            let arc = abs(turn) * before.length / 2
+
+            if pan.length >= tuning.scrollStart, stretch < 1.5 * pan.length, arc < 1.5 * pan.length {
+                scrollMayBegin = false
+                beginGesture(.scrolling, time: time)
+                if abs(pan.y) >= 2 * abs(pan.x) { axisLock = .vertical }
+                else if abs(pan.x) >= 2 * abs(pan.y) { axisLock = .horizontal }
+                else { axisLock = .free }
+                offAxis = 0
+                emitScroll(pan, phase: .began, time: time, &out)
+            } else if stretch >= tuning.pinchStart, stretch >= 1.5 * pan.length, stretch >= arc {
+                cancelMayBegin(&out)
+                beginGesture(.pinching, time: time)
+                lastDistance = now.length
+                out.append(.magnify(phase: .began, delta: 0))
+            } else if arc >= tuning.rotateStart, arc > stretch, arc >= 1.5 * pan.length {
+                cancelMayBegin(&out)
+                beginGesture(.rotating, time: time)
+                lastAngle = Self.angle(now)
+                out.append(.rotate(phase: .began, degrees: 0))
+            }
+
+        default:
+            guard waited >= 0.02, pan.length >= tuning.swipeStart else { return }
+            let axis: SwipeAxis = abs(pan.x) >= abs(pan.y) ? .horizontal : .vertical
+            beginGesture(.swiping(axis), time: time)
+            let progress = pan * (1 / tuning.swipeScale)
+            samples.append((time, progress))
+            out.append(.swipe(axis: axis, phase: .began, delta: 0, velocity: 0))
+            out.append(.swipe(axis: axis, phase: .changed,
+                              delta: axis == .horizontal ? progress.x : progress.y, velocity: 0))
+        }
+    }
+
+    private func beginGesture(_ newMode: Mode, time: Double) {
+        mode = newMode
+        sessionGestured = true
+        gestureStart = time
+        samples = []
+        smoothedSpeed = 0
+    }
+
+    private func beginDrag(_ out: inout [Action]) {
+        dragCandidate = false
+        sessionGestured = true
+        mode = .dragging
+        smoothedSpeed = 0
+        out.append(.buttonDown(.left))
+    }
+
+    private func movePointer(_ delta: Vec, _ out: inout [Action]) {
+        guard delta != .zero else { return }
+        let gain = Curves.pointerGain(speed: smoothedSpeed, setting: tuning.pointerSpeed)
+        out.append(.move(dx: delta.x * gain, dy: delta.y * gain))
+    }
+
+    private func emitScroll(_ delta: Vec, phase: Phase, time: Double, _ out: inout [Action]) {
+        var d = delta
+        switch axisLock {
+        case .vertical:
+            offAxis += d.x
+            if abs(offAxis) > 6 { axisLock = .free } else { d.x = 0 }
+        case .horizontal:
+            offAxis += d.y
+            if abs(offAxis) > 6 { axisLock = .free } else { d.y = 0 }
+        case .free:
+            break
+        }
+        let gain = Curves.scrollGain(speed: smoothedSpeed, setting: tuning.scrollSpeed)
+        let points = d * gain
+        samples.append((time, points))
+        if points != .zero || phase == .began {
+            out.append(.scroll(phase: phase, dx: points.x, dy: points.y, velocity: .zero))
+        }
+    }
+
+    /// Average movement of the fingers that were also down last frame.
+    private func meanDelta(_ active: [Track]) -> Vec {
+        guard !active.isEmpty else { return .zero }
+        return active.reduce(Vec.zero) { $0 + ($1.position - $1.previous) } * (1 / Double(active.count))
+    }
+
+    /// Speed over the last few hundredths of a second, in whatever unit `samples` holds, per second.
+    /// Zero if the fingers had already come to rest.
+    private func recentVelocity(at time: Double) -> Vec {
+        let window = 0.07
+        guard let last = samples.last(where: { $0.delta != .zero }), time - last.time <= 0.05 else { return .zero }
+        let recent = samples.filter { $0.time > time - window }
+        let span = max(0.016, min(window, time - gestureStart))
+        return recent.reduce(Vec.zero) { $0 + $1.delta } * (1 / span)
+    }
+
+    private func updateButtons(_ new: UInt8, _ out: inout [Action]) {
+        guard new != buttons else { return }
+        for (bit, button) in [MouseButton.left, .right, .middle].enumerated() {
+            let mask = UInt8(1 << bit)
+            if new & mask != 0, buttons & mask == 0 { out.append(.buttonDown(button)) }
+            if new & mask == 0, buttons & mask != 0 { out.append(.buttonUp(button)) }
+        }
+        buttons = new
+    }
+
+    private static func angle(_ v: Vec) -> Double { atan2(v.y, v.x) }
+    private static func wrap(_ a: Double) -> Double {
+        var r = a
+        while r > .pi { r -= 2 * .pi }
+        while r < -.pi { r += 2 * .pi }
+        return r
+    }
+}
