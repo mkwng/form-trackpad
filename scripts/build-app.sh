@@ -15,6 +15,8 @@ identity=$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID A
 [[ -n $identity ]] || { echo "No Developer ID signing identity found" >&2; exit 1 }
 codesign --force --options runtime --timestamp=none --sign "$identity" "$app"
 
+codesign --verify --strict "$app"
+
 if [[ ${1:-} == --install ]]; then
   rm -rf "/Applications/Form Trackpad.app"
   cp -R "$app" "/Applications/Form Trackpad.app"
