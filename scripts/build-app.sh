@@ -13,7 +13,7 @@ cp Support/Info.plist "$app/Contents/Info.plist"
 
 identity=$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/ {print $2; exit}')
 [[ -n $identity ]] || { echo "No Developer ID signing identity found" >&2; exit 1 }
-codesign --force --options runtime --sign "$identity" "$app"
+codesign --force --options runtime --timestamp=none --sign "$identity" "$app"
 
 if [[ ${1:-} == --install ]]; then
   rm -rf "/Applications/Form Trackpad.app"

@@ -17,12 +17,13 @@ permission to post events. Quitting it hands the pad back to macOS unchanged.
 | 1 | Tap | Click |
 | 1 | Tap, then touch and move | Drag (lift briefly to reposition; the drag ends a quarter second after letting go) |
 | 2 | Tap | Right click |
+| 2 | Double tap | Smart zoom |
 | 2 | Move | Scroll, with momentum; swipes between pages in Safari |
-| 2 | Pinch | Zoom |
-| 2 | Twist | Rotate |
-| 3 | Tap | Middle click |
+| 2 | Pinch, twist | Zoom and rotate, together with scrolling if the fingers also travel |
+| 3 | Tap | Look up |
 | 3 or 4 | Swipe sideways | Switch Spaces and full-screen apps |
 | 3 or 4 | Swipe up or down | Mission Control, App Exposé |
+| 4 | Spread or pinch | Show Desktop, Apps |
 
 Touches that land within a third of a second of a keystroke are ignored, so palms don't click.
 

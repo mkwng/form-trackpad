@@ -32,6 +32,7 @@ final class EventSynth {
         static let rotation: UInt32 = 5
         static let scroll: UInt32 = 6
         static let zoom: UInt32 = 8
+        static let zoomToggle: UInt32 = 22
         static let velocity: UInt32 = 9
         static let dockSwipe: UInt32 = 23
     }
@@ -106,6 +107,13 @@ final class EventSynth {
             postGesture(subtype: HIDType.zoom, phase: phase, field: Field.magnification, value: delta)
         case .rotate(let phase, let degrees):
             postGesture(subtype: HIDType.rotation, phase: phase, field: Field.rotation, value: degrees)
+        case .smartZoom:
+            guard let event = CGEvent(source: nil) else { return }
+            event.type = EventType.gesture
+            event.setIntegerValueField(Field.gestureSubtype, value: Int64(HIDType.zoomToggle))
+            event.post(tap: .cgSessionEventTap)
+        case .lookUp:
+            lookUp()
         case .swipe(let axis, let phase, let delta, let velocity):
             swipe(axis, phase, delta, velocity)
         }
@@ -301,6 +309,16 @@ final class EventSynth {
         if m.began { postScroll(points: .zero, phase: 0, momentumPhase: 3) }
     }
 
+    /// Control-Command-D is the system shortcut for "look up the word under the pointer".
+    private func lookUp() {
+        let keyD: CGKeyCode = 2
+        for down in [true, false] {
+            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyD, keyDown: down) else { return }
+            event.flags = [.maskControl, .maskCommand]
+            event.post(tap: .cgSessionEventTap)
+        }
+    }
+
     // MARK: Pinch and rotate
 
     private func postGesture(subtype: UInt32, phase: Phase, field: CGEventField, value: Double) {
@@ -316,6 +334,8 @@ final class EventSynth {
 
     /// Sign that makes "fingers right" and "fingers down" match what a Magic Trackpad sends.
     static let swipeSign = -1.0
+    /// Same, for four fingers spreading apart.
+    static let spreadSign = 1.0
 
     private func swipe(_ axis: SwipeAxis, _ phase: Phase, _ delta: Double, _ velocity: Double) {
         swipeResend.forEach { $0.cancel() }
@@ -323,14 +343,16 @@ final class EventSynth {
 
         var phase = phase
         if phase == .began { swipeOffset = 0 }
-        swipeOffset += delta * Self.swipeSign
-        let exitVelocity = velocity * Self.swipeSign
+        let sign = axis == .pinch ? Self.spreadSign : Self.swipeSign
+        swipeOffset += delta * sign
+        let exitVelocity = velocity * sign
         // Let go while moving back toward where the swipe started: treat it as changing one's mind.
         if phase == .ended, exitVelocity != 0, (exitVelocity < 0) != (swipeOffset < 0) { phase = .cancelled }
 
         let options = UInt32(Self.hidPhase(phase)) << HIDField.phaseShift
         let hid = IOHIDEventCreate(kCFAllocatorDefault, HIDType.dockSwipe, 0, options)
-        IOHIDEventSetIntegerValue(hid, HIDField.dockSwipeMotion, axis == .horizontal ? 1 : 2)
+        let motion: [SwipeAxis: Int] = [.horizontal: 1, .vertical: 2, .pinch: 3]
+        IOHIDEventSetIntegerValue(hid, HIDField.dockSwipeMotion, motion[axis]!)
         IOHIDEventSetIntegerValue(hid, HIDField.dockSwipeFlavor, HIDField.dockFlavorPrimary)
         IOHIDEventSetFloatValue(hid, HIDField.dockSwipeProgress, swipeOffset)
         if phase == .ended || phase == .cancelled {

@@ -52,6 +52,11 @@ public final class GestureEngine {
     private var dragCandidate = false
     /// We are holding the left button after a drag lift, until this time.
     private var dragReleaseAt: Double?
+    /// A two-finger tap happened; it becomes a right click at this time unless a second tap
+    /// turns the pair into a smart zoom first.
+    private var rightClickAt: Double?
+    private var lastRadius = 0.0
+    private var radiusFingers = 0
 
     private var gestureStart = 0.0
     private var smoothedSpeed = 0.0
@@ -122,7 +127,18 @@ public final class GestureEngine {
         if dragCandidate, mode == .pending, fingerCount == 1, time - sessionStart > tuning.tapMaxDuration {
             beginDrag(&out)
         }
+        if let due = rightClickAt, time >= due, !secondTapUnderway(at: time) {
+            rightClickAt = nil
+            out.append(.click(.right))
+        }
         return out
+    }
+
+    /// Fingers are down again after a two-finger tap and could still turn out to be a second tap.
+    private func secondTapUnderway(at time: Double) -> Bool {
+        fingerCount > 0 && !sessionGestured && sessionMaxFingers <= 2
+            && time - sessionStart <= tuning.tapMaxDuration + 0.05
+            && sessionMaxTravel <= tuning.tapSlop * 1.5
     }
 
     /// When `advance` next needs to be called, if no report arrives first.
@@ -131,6 +147,9 @@ public final class GestureEngine {
         if let release = dragReleaseAt { deadlines.append(release) }
         if dragCandidate, mode == .pending, fingerCount == 1 {
             deadlines.append(sessionStart + tuning.tapMaxDuration + 0.001)
+        }
+        if let due = rightClickAt {
+            deadlines.append(fingerCount > 0 ? max(due, sessionStart + tuning.tapMaxDuration + 0.06) : due)
         }
         return deadlines.min()
     }
@@ -146,6 +165,7 @@ public final class GestureEngine {
         fingerCount = 0
         dragReleaseAt = nil
         armedUntil = nil
+        rightClickAt = nil
         dragCandidate = false
         return out
     }
@@ -245,22 +265,37 @@ public final class GestureEngine {
         endGesture(time: time, fingersLeft: 0, &out)
         cancelMayBegin(&out)
 
-        if mode == .dragging {
-            dragReleaseAt = time + tuning.dragReleaseDelay
-        } else if !sessionGestured, !sessionSuspect, secondsSinceKeystroke() >= tuning.typingGuard {
+        var tapFingers = 0
+        if mode != .dragging, !sessionGestured, !sessionSuspect, secondsSinceKeystroke() >= tuning.typingGuard {
             let multi = sessionMaxFingers > 1
             let quick = time - sessionStart <= tuning.tapMaxDuration + (multi ? 0.05 : 0)
             let still = sessionMaxTravel <= tuning.tapSlop * (multi ? 1.5 : 1)
-            if quick, still {
-                switch sessionMaxFingers {
-                case 1:
-                    out.append(.click(.left))
-                    armedUntil = time + tuning.tapDragWindow
-                case 2: out.append(.click(.right))
-                case 3: out.append(.click(.middle))
-                default: break
-                }
+            if quick, still { tapFingers = sessionMaxFingers }
+        }
+        // An earlier two-finger tap that this touch did not complete is a right click after all.
+        if rightClickAt != nil, tapFingers != 2 {
+            rightClickAt = nil
+            out.append(.click(.right))
+        }
+
+        if mode == .dragging {
+            dragReleaseAt = time + tuning.dragReleaseDelay
+        }
+        switch tapFingers {
+        case 1:
+            out.append(.click(.left))
+            armedUntil = time + tuning.tapDragWindow
+        case 2:
+            if rightClickAt != nil {
+                rightClickAt = nil
+                out.append(.smartZoom)
+            } else {
+                rightClickAt = time + tuning.doubleTapWindow
             }
+        case 3:
+            out.append(.lookUp)
+        default:
+            break
         }
         dragCandidate = false
         mode = .idle
@@ -280,7 +315,7 @@ public final class GestureEngine {
             scrolling = false; zooming = false; rotating = false
         case .swiping(let axis):
             let v = recentVelocity(at: time)
-            out.append(.swipe(axis: axis, phase: .ended, delta: 0, velocity: axis == .horizontal ? v.x : v.y))
+            out.append(.swipe(axis: axis, phase: .ended, delta: 0, velocity: axis == .vertical ? v.y : v.x))
         default:
             break
         }
@@ -306,6 +341,17 @@ public final class GestureEngine {
 
         case .transforming:
             transform(active, delta: delta, time: time, dt: dt, &out)
+
+        case .swiping(.pinch):
+            let radius = Self.radius(active.map(\.position))
+            if active.count != radiusFingers {
+                radiusFingers = active.count
+                lastRadius = radius
+            }
+            let amount = (radius - lastRadius) / tuning.spreadScale
+            lastRadius = radius
+            samples.append((time, Vec(amount, 0)))
+            if amount != 0 { out.append(.swipe(axis: .pinch, phase: .changed, delta: amount, velocity: 0)) }
 
         case .swiping(let axis):
             let progress = delta * (1 / tuning.swipeScale)
@@ -375,7 +421,23 @@ public final class GestureEngine {
             }
 
         default:
-            guard waited >= 0.02, pan.length >= tuning.swipeStart else { return }
+            guard waited >= 0.02 else { return }
+            var spread = 0.0
+            if active.count >= 4 {
+                let radius = Self.radius(active.map(\.position))
+                spread = radius - Self.radius(active.map(\.origin))
+                if abs(spread) >= 3, abs(spread) > pan.length {
+                    beginGesture(.swiping(.pinch), time: time)
+                    lastRadius = radius
+                    radiusFingers = active.count
+                    let amount = spread / tuning.spreadScale
+                    samples.append((time, Vec(amount, 0)))
+                    out.append(.swipe(axis: .pinch, phase: .began, delta: 0, velocity: 0))
+                    out.append(.swipe(axis: .pinch, phase: .changed, delta: amount, velocity: 0))
+                    return
+                }
+            }
+            guard pan.length >= tuning.swipeStart, pan.length > abs(spread) else { return }
             let axis: SwipeAxis = abs(pan.x) >= abs(pan.y) ? .horizontal : .vertical
             beginGesture(.swiping(axis), time: time)
             let progress = pan * (1 / tuning.swipeScale)
@@ -501,6 +563,12 @@ public final class GestureEngine {
             if new & mask == 0, buttons & mask != 0 { out.append(.buttonUp(button)) }
         }
         buttons = new
+    }
+
+    /// Average distance of the fingers from their common centre.
+    private static func radius(_ points: [Vec]) -> Double {
+        let centre = points.reduce(Vec.zero, +) * (1 / Double(points.count))
+        return points.reduce(0) { $0 + ($1 - centre).length } / Double(points.count)
     }
 
     private static func angle(_ v: Vec) -> Double { atan2(v.y, v.x) }

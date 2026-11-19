@@ -37,7 +37,8 @@ public struct Frame: Equatable {
 
 public enum Phase: Equatable { case mayBegin, began, changed, ended, cancelled }
 public enum MouseButton: Equatable, CaseIterable { case left, right, middle }
-public enum SwipeAxis: Equatable { case horizontal, vertical }
+/// `pinch` is four fingers spreading apart or closing together.
+public enum SwipeAxis: Equatable { case horizontal, vertical, pinch }
 
 /// What the engine wants done. Distances are in screen points; x grows right and y grows down,
 /// following the fingers.
@@ -54,7 +55,11 @@ public enum Action: Equatable {
     case magnify(phase: Phase, delta: Double)
     /// Degrees, counterclockwise positive.
     case rotate(phase: Phase, degrees: Double)
-    /// `delta` is progress, where 1.0 is a full swipe. Positive is fingers moving right or down.
+    /// Two-finger double tap: zoom in on what is under the pointer, or back out.
+    case smartZoom
+    /// Three-finger tap: look up the word under the pointer.
+    case lookUp
+    /// `delta` is progress, where 1.0 is a full swipe. Positive is fingers moving right, down, or apart.
     /// `velocity` is progress per second, meaningful on `.ended`.
     case swipe(axis: SwipeAxis, phase: Phase, delta: Double, velocity: Double)
 }
@@ -81,6 +86,10 @@ public struct Tuning: Equatable {
     public var pinchScale = 45.0
     /// Millimetres of travel that count as one full swipe.
     public var swipeScale = 55.0
+    /// Millimetres each of four fingers moves outward for a full spread.
+    public var spreadScale = 25.0
+    /// A second two-finger tap this soon after the first makes a smart zoom instead of a right click.
+    public var doubleTapWindow = 0.2
 
     public init() {}
 }

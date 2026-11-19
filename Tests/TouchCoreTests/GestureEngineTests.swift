@@ -154,17 +154,73 @@ final class GestureEngineTests: XCTestCase {
         pad.down(0, 30, 30); pad.down(1, 45, 30)
         pad.wait(0.05)
         pad.up(0); pad.up(1)
+        XCTAssertEqual(pad.count(.click(.right)), 0, "waits a moment in case a second tap follows")
+        XCTAssertNotNil(pad.engine.nextDeadline)
+        pad.wait(0.25)
         XCTAssertEqual(pad.count(.click(.right)), 1)
         XCTAssertEqual(pad.count(.click(.left)), 0)
         XCTAssertEqual(pad.scrollPhases, [.mayBegin, .cancelled])
     }
 
-    func testThreeFingerTapMiddleClicks() {
+    func testTwoFingerDoubleTapSmartZooms() {
+        let pad = Pad()
+        pad.down(0, 30, 30); pad.down(1, 45, 30); pad.wait(0.05); pad.up(0, 1)
+        pad.wait(0.1)
+        pad.down(0, 30, 30); pad.down(1, 45, 30); pad.wait(0.2); pad.up(0, 1)
+        pad.wait(0.5)
+        XCTAssertEqual(pad.count(.smartZoom), 1)
+        XCTAssertEqual(pad.count(.click(.right)), 0)
+    }
+
+    func testTwoFingerTapThenScrollStillRightClicks() {
+        let pad = Pad()
+        pad.down(0, 30, 30); pad.down(1, 45, 30); pad.wait(0.05); pad.up(0, 1)
+        pad.wait(0.1)
+        pad.down(0, 30, 30); pad.down(1, 45, 30)
+        pad.drag([0: Vec(0, 20), 1: Vec(0, 20)], over: 0.2)
+        pad.up(0, 1)
+        XCTAssertEqual(pad.count(.click(.right)), 1)
+        XCTAssertEqual(pad.count(.smartZoom), 0)
+        XCTAssertTrue(pad.scrollPhases.contains(.began))
+    }
+
+    func testTwoFingerTapThenOneFingerTapDoesBoth() {
+        let pad = Pad()
+        pad.down(0, 30, 30); pad.down(1, 45, 30); pad.wait(0.05); pad.up(0, 1)
+        pad.wait(0.1)
+        pad.down(0, 30, 30); pad.wait(0.05); pad.up(0)
+        let clicks = pad.actions.filter { $0 == .click(.right) || $0 == .click(.left) }
+        XCTAssertEqual(clicks, [.click(.right), .click(.left)])
+    }
+
+    func testThreeFingerTapLooksUp() {
         let pad = Pad()
         pad.down(0, 20, 30); pad.down(1, 35, 30); pad.down(2, 50, 30)
         pad.wait(0.05)
         pad.up(0, 1, 2)
-        XCTAssertEqual(pad.count(.click(.middle)), 1)
+        XCTAssertEqual(pad.count(.lookUp), 1)
+    }
+
+    func testFourFingersSpreadingApart() {
+        let pad = Pad()
+        pad.down(0, 20, 70); pad.down(1, 30, 50); pad.down(2, 40, 50); pad.down(3, 50, 55)
+        pad.drag([0: Vec(-12, 12), 1: Vec(-4, -12), 2: Vec(4, -12), 3: Vec(12, -6)], over: 0.25)
+        pad.up(0, 1, 2, 3)
+        let total = pad.actions.reduce(0.0) { sum, action in
+            if case .swipe(.pinch, _, let delta, _) = action { return sum + delta }
+            return sum
+        }
+        XCTAssertGreaterThan(total, 0.3)
+        XCTAssertEqual(pad.count(.swipe(axis: .pinch, phase: .began, delta: 0, velocity: 0)), 1)
+        XCTAssertFalse(pad.actions.contains { if case .swipe(.vertical, _, _, _) = $0 { return true } else { return false } })
+    }
+
+    func testFourFingersSwipingUpIsNotASpread() {
+        let pad = Pad()
+        pad.down(0, 15, 60); pad.down(1, 27, 55); pad.down(2, 40, 55); pad.down(3, 52, 60)
+        pad.drag([0: Vec(0, -25), 1: Vec(0, -27), 2: Vec(0, -27), 3: Vec(0, -25)], over: 0.2)
+        XCTAssertEqual(pad.count(.swipe(axis: .vertical, phase: .began, delta: 0, velocity: 0)), 1)
+        XCTAssertEqual(pad.count(.swipe(axis: .pinch, phase: .began, delta: 0, velocity: 0)), 0)
     }
 
     func testTwoFingersScrollAndCoast() {
