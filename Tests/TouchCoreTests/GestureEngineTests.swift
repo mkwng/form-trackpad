@@ -233,6 +233,72 @@ final class GestureEngineTests: XCTestCase {
         XCTAssertFalse(pad.scrollPhases.contains(.began))
     }
 
+    private func total(_ pad: Pad, magnify: Bool) -> Double {
+        pad.actions.reduce(0.0) { sum, action in
+            if magnify, case .magnify(_, let delta) = action { return sum + delta }
+            if !magnify, case .rotate(_, let degrees) = action { return sum + degrees }
+            return sum
+        }
+    }
+
+    func testPinchThenMoveZoomsAndPansTogether() {
+        let pad = Pad()
+        pad.down(0, 25, 60); pad.down(1, 40, 60)
+        pad.drag([0: Vec(-6, 0), 1: Vec(6, 0)], over: 0.2)
+        XCTAssertFalse(pad.scrollPhases.contains(.began))
+        // Keep spreading while carrying both fingers up the pad.
+        pad.drag([0: Vec(-4, -20), 1: Vec(4, -20)], over: 0.3)
+        XCTAssertTrue(pad.scrollPhases.contains(.began))
+        XCTAssertLessThan(pad.scrolled.y, -50)
+        XCTAssertGreaterThan(total(pad, magnify: true), 0.35)
+        pad.up(0, 1)
+        guard case .scroll(.ended, _, _, let velocity) = pad.actions.first(where: {
+            if case .scroll(.ended, _, _, _) = $0 { return true } else { return false }
+        }) else { return XCTFail("no scroll end") }
+        XCTAssertEqual(velocity, .zero, "no coasting after a zoom")
+        XCTAssertEqual(pad.count(.magnify(phase: .ended, delta: 0)), 1)
+    }
+
+    func testPinchAndTwistTogether() {
+        let pad = Pad()
+        pad.down(0, 25, 60); pad.down(1, 40, 60)
+        pad.drag([0: Vec(-6, 0), 1: Vec(6, 0)], over: 0.2)
+        pad.drag([0: Vec(-2, 9), 1: Vec(2, -9)], over: 0.3)
+        XCTAssertEqual(pad.count(.rotate(phase: .began, degrees: 0)), 1)
+        XCTAssertGreaterThan(total(pad, magnify: false), 12)
+        XCTAssertGreaterThan(total(pad, magnify: true), 0.25)
+    }
+
+    func testScrollThenDeliberatePinchAddsZoom() {
+        let pad = Pad()
+        pad.down(0, 25, 40); pad.down(1, 40, 40)
+        pad.drag([0: Vec(0, 15), 1: Vec(0, 15)], over: 0.3)
+        pad.wait(0.3)
+        pad.drag([0: Vec(-8, 0), 1: Vec(8, 0)], over: 0.25)
+        XCTAssertEqual(pad.count(.magnify(phase: .began, delta: 0)), 1)
+    }
+
+    func testFingersDriftingApartDuringAScrollDoNotZoom() {
+        let pad = Pad()
+        pad.down(0, 25, 30); pad.down(1, 40, 30)
+        pad.drag([0: Vec(-3, 60), 1: Vec(3, 60)], over: 0.8)
+        XCTAssertEqual(pad.count(.magnify(phase: .began, delta: 0)), 0)
+        XCTAssertEqual(pad.count(.rotate(phase: .began, degrees: 0)), 0)
+        // One finger running ahead of the other should not rotate either.
+        let other = Pad()
+        other.down(0, 25, 30); other.down(1, 40, 30)
+        other.drag([0: Vec(0, 50), 1: Vec(0, 58)], over: 0.5)
+        XCTAssertEqual(other.count(.rotate(phase: .began, degrees: 0)), 0)
+        XCTAssertEqual(other.count(.magnify(phase: .began, delta: 0)), 0)
+    }
+
+    func testPinchWithARestingThumbDoesNotPan() {
+        let pad = Pad()
+        pad.down(0, 20, 80); pad.down(1, 35, 65)
+        pad.drag([1: Vec(14, -14)], over: 0.3)
+        XCTAssertFalse(pad.scrollPhases.contains(.began))
+    }
+
     func testTwistingTwoFingersRotates() {
         let pad = Pad()
         pad.down(0, 25, 40); pad.down(1, 45, 40)

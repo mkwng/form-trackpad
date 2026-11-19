@@ -23,7 +23,9 @@ public final class GestureEngine {
     }
 
     private enum Mode: Equatable {
-        case idle, pending, pointing, dragging, scrolling, pinching, rotating
+        case idle, pending, pointing, dragging
+        /// Two fingers doing any mix of scrolling, zooming and rotating.
+        case transforming
         case swiping(SwipeAxis)
         /// A multi-finger gesture just ended with fingers still down; ignore them until `until`.
         case settling(until: Double)
@@ -58,6 +60,18 @@ public final class GestureEngine {
     private var samples: [(time: Double, delta: Vec)] = []
     private var lastDistance = 0.0
     private var lastAngle = 0.0
+
+    // Which parts of a two-finger gesture are live. Each starts on its own once the fingers
+    // clearly mean it, and then runs alongside the others until the fingers lift.
+    private var scrolling = false
+    private var zooming = false
+    private var rotating = false
+    private var pair: [Int] = []
+    /// Recent pan, spread and twist in millimetres. They fade over about half a second, so slow
+    /// drift never adds up to a gesture but a deliberate motion does.
+    private var recentPan = Vec.zero
+    private var recentStretch = 0.0
+    private var recentArc = 0.0
 
     // MARK: Input
 
@@ -163,19 +177,17 @@ public final class GestureEngine {
             enterPending(count: count, time: time, &out)
         case .dragging:
             break
-        case .scrolling:
+        case .transforming:
+            let scrollOnly = scrolling && !zooming && !rotating
             if count < 2 {
                 endGesture(time: time, fingersLeft: count, &out)
-                mode = .settling(until: time + 0.15)
-            } else if count >= 3, time - gestureStart < 0.1 {
+                // After a plain scroll the remaining finger may carry on pointing.
+                mode = .settling(until: scrollOnly ? time + 0.15 : .infinity)
+            } else if count >= 3, scrollOnly, time - gestureStart < 0.1 {
                 // A third finger landed just after two started moving: it was a swipe all along.
                 out.append(.scroll(phase: .ended, dx: 0, dy: 0, velocity: .zero))
+                scrolling = false
                 enterPending(count: count, time: time, &out)
-            }
-        case .pinching, .rotating:
-            if count < 2 {
-                endGesture(time: time, fingersLeft: count, &out)
-                mode = .settling(until: .infinity)
             }
         case .swiping:
             if count < 3 {
@@ -257,12 +269,15 @@ public final class GestureEngine {
     /// Closes the scroll, pinch, rotate or swipe in progress, if any.
     private func endGesture(time: Double, fingersLeft: Int, _ out: inout [Action]) {
         switch mode {
-        case .scrolling:
-            out.append(.scroll(phase: .ended, dx: 0, dy: 0, velocity: recentVelocity(at: time)))
-        case .pinching:
-            out.append(.magnify(phase: .ended, delta: 0))
-        case .rotating:
-            out.append(.rotate(phase: .ended, degrees: 0))
+        case .transforming:
+            if scrolling {
+                // Coasting after a zoom or a twist would slide the picture away, so only a plain scroll coasts.
+                let velocity = zooming || rotating ? Vec.zero : recentVelocity(at: time)
+                out.append(.scroll(phase: .ended, dx: 0, dy: 0, velocity: velocity))
+            }
+            if zooming { out.append(.magnify(phase: .ended, delta: 0)) }
+            if rotating { out.append(.rotate(phase: .ended, degrees: 0)) }
+            scrolling = false; zooming = false; rotating = false
         case .swiping(let axis):
             let v = recentVelocity(at: time)
             out.append(.swipe(axis: axis, phase: .ended, delta: 0, velocity: axis == .horizontal ? v.x : v.y))
@@ -289,23 +304,8 @@ public final class GestureEngine {
         case .pointing, .dragging:
             movePointer(delta, &out)
 
-        case .scrolling:
-            emitScroll(delta, phase: .changed, time: time, &out)
-
-        case .pinching:
-            guard active.count >= 2 else { break }
-            let distance = (active[1].position - active[0].position).length
-            let change = (distance - lastDistance) / tuning.pinchScale
-            lastDistance = distance
-            if change != 0 { out.append(.magnify(phase: .changed, delta: change)) }
-
-        case .rotating:
-            guard active.count >= 2 else { break }
-            let angle = Self.angle(active[1].position - active[0].position)
-            let change = Self.wrap(angle - lastAngle)
-            lastAngle = angle
-            // The pad's y axis points down, so a positive angle change is clockwise on the pad.
-            if change != 0 { out.append(.rotate(phase: .changed, degrees: -change * 180 / .pi)) }
+        case .transforming:
+            transform(active, delta: delta, time: time, dt: dt, &out)
 
         case .swiping(let axis):
             let progress = delta * (1 / tuning.swipeScale)
@@ -345,24 +345,33 @@ public final class GestureEngine {
             let turn = Self.wrap(Self.angle(now) - Self.angle(before))
             let arc = abs(turn) * before.length / 2
 
-            if pan.length >= tuning.scrollStart, stretch < 1.5 * pan.length, arc < 1.5 * pan.length {
+            let startsScroll = pan.length >= tuning.scrollStart && stretch < 1.5 * pan.length && arc < 1.5 * pan.length
+            let startsZoom = stretch >= tuning.pinchStart && stretch >= 1.5 * pan.length && stretch >= arc
+            let startsRotate = arc >= tuning.rotateStart && arc > stretch && arc >= 1.5 * pan.length
+            guard startsScroll || startsZoom || startsRotate else { return }
+
+            beginGesture(.transforming, time: time)
+            pair = [active[0].id, active[1].id]
+            lastDistance = now.length
+            lastAngle = Self.angle(now)
+            recentPan = .zero; recentStretch = 0; recentArc = 0
+            if startsScroll {
                 scrollMayBegin = false
-                beginGesture(.scrolling, time: time)
+                scrolling = true
                 if abs(pan.y) >= 2 * abs(pan.x) { axisLock = .vertical }
                 else if abs(pan.x) >= 2 * abs(pan.y) { axisLock = .horizontal }
                 else { axisLock = .free }
                 offAxis = 0
                 emitScroll(pan, phase: .began, time: time, &out)
-            } else if stretch >= tuning.pinchStart, stretch >= 1.5 * pan.length, stretch >= arc {
+            } else {
                 cancelMayBegin(&out)
-                beginGesture(.pinching, time: time)
-                lastDistance = now.length
-                out.append(.magnify(phase: .began, delta: 0))
-            } else if arc >= tuning.rotateStart, arc > stretch, arc >= 1.5 * pan.length {
-                cancelMayBegin(&out)
-                beginGesture(.rotating, time: time)
-                lastAngle = Self.angle(now)
-                out.append(.rotate(phase: .began, degrees: 0))
+                if startsZoom {
+                    zooming = true
+                    out.append(.magnify(phase: .began, delta: 0))
+                } else {
+                    rotating = true
+                    out.append(.rotate(phase: .began, degrees: 0))
+                }
             }
 
         default:
@@ -374,6 +383,55 @@ public final class GestureEngine {
             out.append(.swipe(axis: axis, phase: .began, delta: 0, velocity: 0))
             out.append(.swipe(axis: axis, phase: .changed,
                               delta: axis == .horizontal ? progress.x : progress.y, velocity: 0))
+        }
+    }
+
+    /// One frame of a two-finger gesture: feed the live parts, and let the others join in.
+    private func transform(_ active: [Track], delta: Vec, time: Double, dt: Double, _ out: inout [Action]) {
+        guard active.count >= 2 else { return }
+        let between = active[1].position - active[0].position
+        let ids = [active[0].id, active[1].id]
+        if ids != pair {
+            // A different pair of fingers: measure from here rather than jump.
+            pair = ids
+            lastDistance = between.length
+            lastAngle = Self.angle(between)
+        }
+        let spread = between.length - lastDistance
+        let turn = Self.wrap(Self.angle(between) - lastAngle)
+        lastDistance = between.length
+        lastAngle = Self.angle(between)
+
+        let fade = exp(-dt / 0.4)
+        recentPan = recentPan * fade + delta
+        recentStretch = recentStretch * fade + spread
+        recentArc = recentArc * fade + turn * between.length / 2
+        let pan = recentPan.length, stretch = abs(recentStretch), arc = abs(recentArc)
+
+        // Joining an existing gesture takes a clearer motion than starting one, and it has to hold
+        // its own against what the fingers are already doing. A scroll with fingers drifting apart
+        // stays a scroll; a pinch with one finger resting does not start to pan.
+        if !scrolling, pan >= 2.5, pan >= 0.6 * max(stretch, arc) {
+            scrolling = true
+            axisLock = .free
+            emitScroll(.zero, phase: .began, time: time, &out)
+        }
+        if !zooming, stretch >= (scrolling && !rotating ? 3.5 : 2), stretch >= max(scrolling ? 0.5 * pan : 0, 0.25 * arc) {
+            zooming = true
+            out.append(.magnify(phase: .began, delta: 0))
+        }
+        if !rotating, arc >= (scrolling && !zooming ? 3.5 : 2), arc >= max(scrolling ? 0.5 * pan : 0, 0.25 * stretch) {
+            rotating = true
+            out.append(.rotate(phase: .began, degrees: 0))
+        }
+
+        if scrolling { emitScroll(delta, phase: .changed, time: time, &out) }
+        if zooming, spread != 0 {
+            out.append(.magnify(phase: .changed, delta: spread / tuning.pinchScale))
+        }
+        // The pad's y axis points down, so a positive angle change is clockwise on the pad.
+        if rotating, turn != 0 {
+            out.append(.rotate(phase: .changed, degrees: -turn * 180 / .pi))
         }
     }
 
